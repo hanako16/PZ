@@ -14,6 +14,7 @@ local TS = game:GetService("TeleportService")
 local SG = game:GetService("StarterGui")
 local VIM = game:GetService("VirtualInputManager")
 local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
 
 
 
@@ -36,7 +37,6 @@ end
 
 
 -- ========== CONFIG PERSISTENCE ==========
--- Saves to a JSON file in the executor's workspace folder between sessions.
 local CONFIG_FILE = "PlatinumZ_config.json"
 
 
@@ -55,14 +55,15 @@ end
 
 local function loadConfig()
     local defaults = {
-        autofarm   = false,
-        serverhop  = true,
-        invisible  = false,
-        targetKills = 3,
-        range       = 250,
-        stickDist   = 4.2,
-        lowHealthOnly = true,
-        lowHealthThreshold = 0.4,  -- 40% HP cutoff
+        autofarm           = false,
+        serverhop          = true,
+        invisible          = false,
+        targetKills        = 3,
+        range              = 250,
+        stickDist          = 4.2,
+        lowHealthOnly      = true,
+        lowHealthThreshold = 0.4,
+        lowGraphics        = false,
     }
     pcall(function()
         if readfile and isfile and isfile(CONFIG_FILE) then
@@ -90,19 +91,18 @@ getgenv().PlatinumZ = {
     autofarm           = savedCfg.autofarm,
     serverhop          = savedCfg.serverhop,
     invisible          = savedCfg.invisible,
-    kills              = 0,           -- session total, never persisted
+    kills              = 0,
     targetKills        = savedCfg.targetKills,
     range              = savedCfg.range,
     stickDist          = savedCfg.stickDist,
     lowHealthOnly      = savedCfg.lowHealthOnly,
     lowHealthThreshold = savedCfg.lowHealthThreshold,
+    lowGraphics        = savedCfg.lowGraphics,
     lastHop            = 0,
     lastKillCheck      = 0,
     currentChar        = "Unknown",
     target             = nil,
-    killsSeeded        = false,       -- leaderboard baseline flag
-    -- killsSeeded resets on respawn to re-anchor the baseline.
-    -- PZ.kills does NOT reset on respawn Ã¢â‚¬â€ only on hop or manual reset.
+    killsSeeded        = false,
 }
 
 
@@ -123,7 +123,112 @@ local function persistConfig()
         stickDist          = PZ.stickDist,
         lowHealthOnly      = PZ.lowHealthOnly,
         lowHealthThreshold = PZ.lowHealthThreshold,
+        lowGraphics        = PZ.lowGraphics,
     })
+end
+
+
+
+
+-- ========== LOW GRAPHICS MODE ==========
+-- Stores original lighting/render values so they can be fully restored.
+-- Only touches client-side render settings -- hitbox, farm logic, combo engine unaffected.
+local originalGraphics = nil
+
+
+
+
+local function captureOriginalGraphics()
+    if originalGraphics then return end  -- only snapshot once
+    originalGraphics = {
+        -- Lighting properties
+        Brightness          = Lighting.Brightness,
+        Ambient             = Lighting.Ambient,
+        OutdoorAmbient      = Lighting.OutdoorAmbient,
+        FogEnd              = Lighting.FogEnd,
+        FogStart            = Lighting.FogStart,
+        FogColor            = Lighting.FogColor,
+        GlobalShadows       = Lighting.GlobalShadows,
+        -- Render quality
+        QualityLevel        = settings().Rendering.QualityLevel,
+        -- Effects stored for toggling
+        effects             = {}
+    }
+    -- Snapshot all Lighting effects (Bloom, DepthOfField, etc.)
+    for _, eff in ipairs(Lighting:GetChildren()) do
+        if eff:IsA("PostEffect") or eff:IsA("Sky") or eff:IsA("Atmosphere") then
+            table.insert(originalGraphics.effects, {
+                instance = eff,
+                enabled  = eff.Enabled ~= false
+            })
+        end
+    end
+end
+
+
+
+
+local function applyLowGraphics()
+    captureOriginalGraphics()
+
+    -- Kill all post-processing effects (Bloom, Blur, ColorCorrection, SunRays, etc.)
+    for _, eff in ipairs(Lighting:GetChildren()) do
+        if eff:IsA("PostEffect") then
+            eff.Enabled = false
+        end
+    end
+
+    -- Flatten lighting -- reduces GPU overdraw on shadow calculations
+    Lighting.Brightness     = 2
+    Lighting.Ambient        = Color3.fromRGB(180, 180, 180)
+    Lighting.OutdoorAmbient = Color3.fromRGB(180, 180, 180)
+    Lighting.GlobalShadows  = false
+
+    -- Push fog far out so the renderer doesn't process distant geometry
+    Lighting.FogEnd   = 100000
+    Lighting.FogStart = 99000
+    Lighting.FogColor = Color3.fromRGB(0, 0, 0)
+
+    -- Drop render quality to minimum
+    pcall(function()
+        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+    end)
+
+    -- Disable Atmosphere if present (expensive scattering pass)
+    local atmo = Lighting:FindFirstChildOfClass("Atmosphere")
+    if atmo then atmo.Enabled = false end
+end
+
+
+
+
+local function restoreGraphics()
+    if not originalGraphics then return end
+
+    -- Restore post-processing effects to original state
+    for _, entry in ipairs(originalGraphics.effects) do
+        pcall(function()
+            if entry.instance and entry.instance.Parent then
+                if entry.instance:IsA("PostEffect") or entry.instance:IsA("Atmosphere") then
+                    entry.instance.Enabled = entry.enabled
+                end
+            end
+        end)
+    end
+
+    -- Restore lighting
+    Lighting.Brightness     = originalGraphics.Brightness
+    Lighting.Ambient        = originalGraphics.Ambient
+    Lighting.OutdoorAmbient = originalGraphics.OutdoorAmbient
+    Lighting.FogEnd         = originalGraphics.FogEnd
+    Lighting.FogStart       = originalGraphics.FogStart
+    Lighting.FogColor       = originalGraphics.FogColor
+    Lighting.GlobalShadows  = originalGraphics.GlobalShadows
+
+    -- Restore render quality
+    pcall(function()
+        settings().Rendering.QualityLevel = originalGraphics.QualityLevel
+    end)
 end
 
 
@@ -353,9 +458,6 @@ end
 
 
 -- ========== INVISIBILITY ==========
--- Uses LocalTransparencyModifier Ã¢â‚¬â€ client-side visual only.
--- Hitbox and server position are unaffected.
--- Re-applies after every combo cycle so moves don't strip it.
 local function setInvisible(state)
     PZ.invisible = state
     local char = LP.Character
@@ -381,14 +483,16 @@ end
 
 
 
--- Re-apply on respawn. Does NOT reset session kill count.
 LP.CharacterAdded:Connect(function(char)
     task.wait(0.6)
-    -- Re-seed leaderboard baseline on new life
     PZ.killsSeeded = false
-    -- Session kill total survives death Ã¢â‚¬â€ only resets on hop
     if PZ.invisible then
         setInvisible(true)
+    end
+    -- Re-apply low graphics after respawn if still enabled
+    if PZ.lowGraphics then
+        task.wait(0.5)
+        applyLowGraphics()
     end
 end)
 
@@ -494,10 +598,7 @@ end
 
 
 
--- ========== TARGETING Ã¢â‚¬â€ LOW HEALTH PRIORITY ==========
--- Pass 1: find lowest-HP enemy under threshold within range.
--- Pass 2: if nobody qualifies, fall back to closest alive enemy.
--- lowHealthOnly = true means ONLY attack if someone is below threshold.
+-- ========== TARGETING ==========
 local function getClosestEnemy()
     local myChar = LP.Character
     local myHRP  = getHRP(myChar)
@@ -506,7 +607,7 @@ local function getClosestEnemy()
 
 
 
-    local lowTarget, lowestHP   = nil, math.huge
+    local lowTarget, lowestHP    = nil, math.huge
     local anyTarget, closestDist = nil, PZ.range
 
 
@@ -529,7 +630,6 @@ local function getClosestEnemy()
 
 
 
-        -- Track overall closest for fallback
         if dist < closestDist then
             closestDist = dist
             anyTarget   = {player = plr, char = c, hrp = hrp, dist = dist, hpPct = hpPct}
@@ -538,7 +638,6 @@ local function getClosestEnemy()
 
 
 
-        -- Track lowest-HP under threshold
         if hpPct <= PZ.lowHealthThreshold and hum.Health < lowestHP then
             lowestHP  = hum.Health
             lowTarget = {player = plr, char = c, hrp = hrp, dist = dist, hpPct = hpPct}
@@ -549,7 +648,7 @@ local function getClosestEnemy()
 
 
     if lowTarget then return lowTarget end
-    if PZ.lowHealthOnly then return nil end  -- strict mode: no low-HP target = no attack
+    if PZ.lowHealthOnly then return nil end
     return anyTarget
 end
 
@@ -569,7 +668,6 @@ end
 
 
 -- ========== COMBO ENGINE ==========
--- Re-applies invisibility after each combo finishes to recover from move animations.
 local comboRunning = false
 local function runCombo(comboData)
     if comboRunning then return end
@@ -590,7 +688,6 @@ local function runCombo(comboData)
             end
         end
         task.wait(0.15)
-        -- Re-apply invisible: move animations reset LocalTransparencyModifier
         if PZ.invisible then
             setInvisible(true)
         end
@@ -602,8 +699,6 @@ end
 
 
 -- ========== KILL TRACKING ==========
--- killsSeeded: re-anchors baseline on each new life and after each server hop.
--- PZ.kills:    accumulates across deaths within a session, resets only on hop.
 local lastKnownKills = 0
 
 
@@ -627,15 +722,14 @@ local function updateKills()
 
 
     if not PZ.killsSeeded then
-        lastKnownKills  = current   -- anchor baseline, count nothing this tick
+        lastKnownKills  = current
         PZ.killsSeeded  = true
         return
     end
 
 
 
-
-    if current > lastKnownKills then
+if current > lastKnownKills then
         local gained    = current - lastKnownKills
         PZ.kills        = PZ.kills + gained
         lastKnownKills  = current
@@ -652,7 +746,7 @@ local function serverHop()
     PZ.lastHop = tick()
     notify("Platinum Z", "Server hopping after " .. PZ.kills .. " session kills...")
     PZ.kills       = 0
-    PZ.killsSeeded = false   -- re-anchor on the new server's leaderboard value
+    PZ.killsSeeded = false
     pcall(function()
         local placeId = game.PlaceId
         local servers = {}
@@ -732,10 +826,10 @@ end)
 
 -- ========== GUI ==========
 local gui = Instance.new("ScreenGui")
-gui.Name         = "PlatinumZ"
-gui.ResetOnSpawn = false
+gui.Name           = "PlatinumZ"
+gui.ResetOnSpawn   = false
 gui.IgnoreGuiInset = true
-gui.DisplayOrder = 999
+gui.DisplayOrder   = 999
 pcall(function() gui.Parent = LP:WaitForChild("PlayerGui") end)
 PZ.gui = gui
 
@@ -743,7 +837,6 @@ PZ.gui = gui
 
 
 -- Floating open button
-
 local openBtn = Instance.new("TextButton")
 openBtn.Name             = "Open"
 openBtn.Size             = UDim2.new(0, 52, 0, 52)
@@ -761,10 +854,10 @@ openStroke.Thickness     = 1.8
 openStroke.Parent        = openBtn
 
 
--- Main panel
+-- Main panel -- height bumped to 450 to accommodate the new button
 local panel = Instance.new("Frame")
 panel.Name             = "Panel"
-panel.Size             = UDim2.new(0, 230, 0, 400)
+panel.Size             = UDim2.new(0, 230, 0, 450)
 panel.Position         = UDim2.new(0.86, -245, 0.22, 0)
 panel.BackgroundColor3 = Color3.fromRGB(22, 20, 30)
 panel.Visible          = false
@@ -776,32 +869,6 @@ panelStroke.Color      = Color3.fromRGB(100, 85, 160)
 panelStroke.Thickness  = 1.5
 panelStroke.Parent     = panel
 
-
-local function makeLabel(y, defaultText)
-    local lbl = Instance.new("TextLabel")
-    lbl.Size                = UDim2.new(1, -20, 0, 18)
-    lbl.Position            = UDim2.new(0, 10, 0, y)
-    lbl.BackgroundTransparency = 1
-    lbl.Text                = defaultText
-    lbl.TextColor3          = Color3.fromRGB(180, 175, 210)
-    lbl.Font                = Enum.Font.Gotham
-    lbl.TextSize            = 12
-    lbl.TextXAlignment      = Enum.TextXAlignment.Left
-    lbl.Parent              = panel
-    return lbl
-end
-
-
-local titleLbl = Instance.new("TextLabel")
-titleLbl.Size               = UDim2.new(1, -16, 0, 26)
-titleLbl.Position           = UDim2.new(0, 10, 0, 10)
-titleLbl.BackgroundTransparency = 1
-titleLbl.Text               = "Platinum Z"
-titleLbl.TextColor3         = Color3.fromRGB(230, 220, 255)
-titleLbl.Font               = Enum.Font.GothamBold
-titleLbl.TextSize           = 18
-titleLbl.TextXAlignment     = Enum.TextXAlignment.Left
-titleLbl.Parent             = panel
 
 local function makeLabel(y, defaultText)
     local lbl = Instance.new("TextLabel")
@@ -850,9 +917,9 @@ divider.BorderSizePixel  = 0
 divider.Parent           = panel
 
 
-local charLabel  = makeLabel(66,  "Char: Detecting...")
-local killLabel  = makeLabel(86,  "Kills: 0 / " .. PZ.targetKills)
-local hpLabel    = makeLabel(106, "Target: â€”")
+local charLabel = makeLabel(66,  "Char: Detecting...")
+local killLabel = makeLabel(86,  "Kills: 0 / " .. PZ.targetKills)
+local hpLabel   = makeLabel(106, "Target: —")
 
 
 local function makeToggle(y, text, defaultOn, callback)
@@ -913,6 +980,24 @@ local lowHpBtn = makeToggle(256, "Low HP Only", PZ.lowHealthOnly, function(on)
 end)
 
 
+-- *** NEW: Low Graphics Mode button -- sits directly after Low HP Only ***
+local lowGfxBtn = makeToggle(298, "Low Graphics Mode", PZ.lowGraphics, function(on)
+    PZ.lowGraphics = on
+    if on then
+        applyLowGraphics()
+        notify("Platinum Z", "Low Graphics: ON — GPU load reduced")
+    else
+        restoreGraphics()
+        notify("Platinum Z", "Low Graphics: OFF — settings restored")
+    end
+end)
+
+-- Auto-apply on load if it was persisted as ON
+if PZ.lowGraphics then
+    task.spawn(applyLowGraphics)
+end
+
+
 -- Live status updater
 RS.Heartbeat:Connect(function()
     pcall(function()
@@ -922,7 +1007,7 @@ RS.Heartbeat:Connect(function()
             local pct = math.floor((PZ.target.hpPct or 0) * 100)
             hpLabel.Text = "Target HP: " .. pct .. "%"
         else
-            hpLabel.Text = "Target: â€”"
+            hpLabel.Text = "Target: —"
         end
     end)
 end)
@@ -934,6 +1019,7 @@ end)
 
 
 -- ========== STARTUP NOTIFICATIONS ==========
-notify("Platinum Z", "Loaded â€” TSB Auto Farm Ready")
+notify("Platinum Z", "Loaded — TSB Auto Farm Ready")
 task.wait(3.5)
 notify("Platinum Z", "Recommended Character: Sonic (Deadly Ninja)")
+   
