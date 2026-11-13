@@ -7,7 +7,7 @@
 
 
 
-local Players = game:GetService("Players")
+lol Players = game:GetService("Players")
 local RS = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
 local TS = game:GetService("TeleportService")
